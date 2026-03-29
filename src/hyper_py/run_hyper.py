@@ -14,10 +14,10 @@ warnings.filterwarnings("ignore", message=".*Set MJD-OBS to.*")
 
 # Import the main entry point of the package
 try:
-    from hyper_py.hyper import start_hyper
+    from hyper_py_playground.hyper import start_hyper
 except ModuleNotFoundError:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    from hyper_py.hyper import start_hyper
+    from hyper_py_playground.hyper import start_hyper
     
 # importlib.resources for packaged data (fallback to importlib_resources on older Python)
 try:
@@ -32,8 +32,8 @@ try:
 except Exception:
     _HAS_RUAMEL = False
 
-_PKG = "hyper_py"  # top-level package name
-_CONFIG_FILENAME = "hyper_config.yaml"  # custom config filename
+_PKG = "hyper_py_playground"  # top-level package name
+_CONFIG_FILENAME = "hyper_config-playground.yaml"  # custom config filename
 
 
 def _user_config_path() -> Path:
@@ -140,8 +140,6 @@ def _update_dir_root_preserving_comments(config_path: Path, new_dir_root: Path) 
 def main() -> None:
     """Main entry point for CLI execution."""
     cfg_path = _resolve_config_path(sys.argv)
-
-    print("Welcome to HyperPy!")
 
     if not cfg_path.exists():
         # Create new hyper_config.yaml from packaged template
