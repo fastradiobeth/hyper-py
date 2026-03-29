@@ -1,8 +1,12 @@
 import numpy as np
+from scipy.spatial import cKDTree
 
 def group_sources(xcen, ycen, pix_dim, beam_dim, aper_sup):
     '''
     Groups sources based on proximity within the beam scale, ensuring no duplicate groups and transitive merging.
+    
+    Optimized using cKDTree for O(n log n) spatial queries and Union-Find with path compression
+    and union by rank for efficient group merging.
 
     Parameters:
         xcen, ycen: arrays of source positions in pixels
@@ -16,48 +20,70 @@ def group_sources(xcen, ycen, pix_dim, beam_dim, aper_sup):
         deblend: number of neighbors (for Gaussian deblending)
     '''
     n = len(xcen)
-    xcen = np.array(xcen)
-    ycen = np.array(ycen)
+    if n == 0:
+        return np.array([], dtype=int), np.array([]).reshape(0, 0), np.array([], dtype=int)
+    
+    xcen = np.asarray(xcen)
+    ycen = np.asarray(ycen)
 
     max_dist = beam_dim * aper_sup * 2.0
     max_dist_pix = max_dist / pix_dim
         
     start_group = np.zeros(n, dtype=int)
-    common_group = -1 * np.ones((n, n), dtype=int)  # Initialize common_group as a 2D array
+    common_group = -1 * np.ones((n, n), dtype=int)
     deblend = np.zeros(n, dtype=int)
     
-    # Each source is initially its own group
-    group_assignment = np.arange(n, dtype=int)
+    # Union-Find with path compression and union by rank
+    parent = np.arange(n, dtype=int)
+    rank = np.zeros(n, dtype=int)
     
-    def find(group_id):
-        if group_assignment[group_id] != group_id:
-            group_assignment[group_id] = find(group_assignment[group_id])  # Path compression
-        return group_assignment[group_id]
+    def find(i):
+        # Path compression: make every node point directly to root
+        root = i
+        while parent[root] != root:
+            root = parent[root]
+        # Compress path
+        while parent[i] != root:
+            next_i = parent[i]
+            parent[i] = root
+            i = next_i
+        return root
     
-    def union(group1, group2):
-        root1 = find(group1)
-        root2 = find(group2)
-        if root1 != root2:
-            group_assignment[root2] = root1  # Merge the groups
+    def union(i, j):
+        root_i = find(i)
+        root_j = find(j)
+        if root_i != root_j:
+            # Union by rank
+            if rank[root_i] < rank[root_j]:
+                parent[root_i] = root_j
+            elif rank[root_i] > rank[root_j]:
+                parent[root_j] = root_i
+            else:
+                parent[root_j] = root_i
+                rank[root_i] += 1
 
-    # First pass: union sources that are within max_dist_pix of each other
+    # Build KD-tree for efficient spatial queries
+    coords = np.column_stack([xcen, ycen])
+    tree = cKDTree(coords)
+    
+    # Find all pairs within max_dist_pix using KD-tree query_pairs
+    # This is O(n log n + k) where k is the number of pairs, much faster than O(n²)
+    pairs = tree.query_pairs(r=max_dist_pix, output_type='ndarray')
+    
+    # Union all close pairs
+    for i, j in pairs:
+        union(i, j)
+
+    # Flatten all group pointers (ensure all point to root)
+    roots = np.array([find(i) for i in range(n)])
+    
+    # Group sources by their root - vectorized approach
+    unique_roots = np.unique(roots)
+    root_to_members = {root: np.where(roots == root)[0] for root in unique_roots}
+    
+    # Assign group info for each source
     for i in range(n):
-        dx = xcen[i] - xcen
-        dy = ycen[i] - ycen
-        dist = np.sqrt(dx**2 + dy**2)
-        same_group = np.where(dist < max_dist_pix)[0]
-
-        for j in same_group:
-            if find(i) != find(j):
-                union(i, j)
-
-    # Essential fix: flatten all group pointers after union phase
-    for i in range(n):
-        group_assignment[i] = find(i)
-
-    # Second pass: assign group info for each source (same as your original)
-    for i in range(n):
-        group_members = np.where(group_assignment == group_assignment[i])[0]
+        group_members = root_to_members[roots[i]]
         common_group[i, :len(group_members)] = group_members
         deblend[i] = len(group_members) - 1
         if len(group_members) > 1:
