@@ -23,7 +23,7 @@ def write_tables(data_dict, output_dir, config, sigma_thres, real_rms, base_file
         flux_units_beam = 'mJy/beam'
     else:
         flux_units_beam = 'Jy/beam'
-        flux_units = 'Jy'
+        flux_units = 'Jy/beam'
         
     units = {
         'MAP_ID': '', 'HYPER_ID': '', 'BAND': 'GHz',
@@ -62,8 +62,8 @@ def write_tables(data_dict, output_dir, config, sigma_thres, real_rms, base_file
 
     format_dict = {
         'MAP_ID': 's', 'HYPER_ID': 'd', 'RA': '.5f', 'DEC': '.5f', 'GLON': '.5f', 'GLAT': '.5f',
-        'FLUX': '.3e', 'FLUX_ERR': '.3e', 'FLUX_PEAK': '.3e',
-        'FLUX_PEAK_JY': '.3e', 'RESIDUALS': '.3e',
+        'FLUX': '.3f', 'FLUX_ERR': '.3f', 'FLUX_PEAK': '.5f',
+        'FLUX_PEAK_JY': '.4f', 'RESIDUALS': '.5f',
         'FWHM_1': '.3f', 'FWHM_2': '.3f', 'PA': '.1f',
         'NMSE': '.3f', 'CHI2_RED': '.3f', 'BIC': '.2f', 'POLYN': 'd',
         'STATUS': 'd', 'DEBLEND': 'd', 'CLUSTER': 'd',
@@ -109,11 +109,8 @@ def write_tables(data_dict, output_dir, config, sigma_thres, real_rms, base_file
     csv_output_path = os.path.join(output_dir, base_filename + ".csv")
     table.write(csv_output_path, format="ascii.ecsv", overwrite=True)
 
-    # For IPAC, explicitly copy rows to preserve compatibility
-    ipac_table = Table(names=table.colnames, dtype=[table[col].dtype for col in table.colnames])
-
-    for row in table:
-        ipac_table.add_row(row)
+    # For IPAC, copy full table at once (avoids O(n²) add_row loop)
+    ipac_table = table.copy()
 
     # Copy formatting, units, and descriptions again explicitly to IPAC table
     for col in ipac_table.colnames:
