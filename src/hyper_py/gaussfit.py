@@ -1,4 +1,6 @@
 import os
+import time
+import threading
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,10 +10,155 @@ from astropy.wcs import WCS
 from lmfit import minimize, Parameters
 from photutils.aperture import CircularAperture
 
-from hyper_py.visualization import plot_fit_summary
+from hyper_py_playground.visualization import plot_fit_summary
+from hyper_py_playground.performance_timer import get_timer
 from .bkg_single import masked_background_single_sources
 
+
+def run_with_timeout(func, args, kwargs, timeout_seconds):
+    """
+    Run a function with a timeout. Returns (result, timed_out).
+    If timed out, result is None and timed_out is True.
+    
+    NOTE: This uses threading which doesn't reliably kill scipy/numpy operations.
+    For lmfit, use the iter_cb callback approach instead.
+    """
+    result = [None]
+    exception = [None]
+    
+    def target():
+        try:
+            result[0] = func(*args, **kwargs)
+        except Exception as e:
+            exception[0] = e
+    
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout_seconds)
+    
+    if thread.is_alive():
+        return None, True  # Timed out
+    
+    if exception[0] is not None:
+        raise exception[0]
+    
+    return result[0], False
+
+
+class TimeoutCallback:
+    """
+    Callback class for lmfit minimize that aborts fitting after a timeout.
+    Returns True to abort, False to continue.
+    """
+    def __init__(self, timeout_seconds, logger=None):
+        self.timeout_seconds = timeout_seconds
+        self.start_time = None
+        self.logger = logger
+        self.timed_out = False
+        self.iteration_count = 0
+        
+    def __call__(self, params, iter, resid, *args, **kws):
+        if self.start_time is None:
+            self.start_time = time.time()
+        
+        self.iteration_count += 1
+        elapsed = time.time() - self.start_time
+        
+        # Check every 10 iterations to reduce overhead
+        if self.iteration_count % 10 == 0:
+            if elapsed > self.timeout_seconds:
+                self.timed_out = True
+                if self.logger:
+                    self.logger.warning(f"[TIMEOUT] Fit exceeded {self.timeout_seconds}s (iter={iter}, elapsed={elapsed:.1f}s)")
+                return True  # Abort fitting
+        
+        return False  # Continue fitting
+    
+    def reset(self):
+        self.start_time = None
+        self.timed_out = False
+        self.iteration_count = 0
+
+
+class FitTimeoutError(Exception):
+    """Custom exception raised when fit times out."""
+    pass
+
+
+class TimeoutResidualWrapper:
+    """
+    Wrapper around residual function that checks for timeout on each call.
+    Works with least_squares which calls residual function frequently.
+    """
+    def __init__(self, residual_func, timeout_seconds, logger=None):
+        self.residual_func = residual_func
+        self.timeout_seconds = timeout_seconds
+        self.start_time = None
+        self.logger = logger
+        self.timed_out = False
+        self.call_count = 0
+        
+    def __call__(self, params, *args, **kwargs):
+        if self.start_time is None:
+            self.start_time = time.time()
+        
+        self.call_count += 1
+        
+        # Check timeout every 10 calls to ensure responsive timeout
+        if self.call_count % 10 == 0:
+            elapsed = time.time() - self.start_time
+            if elapsed > self.timeout_seconds:
+                self.timed_out = True
+                if self.logger:
+                    self.logger.warning(f"[TIMEOUT] Fit exceeded {self.timeout_seconds}s (calls={self.call_count}, elapsed={elapsed:.1f}s)")
+                # Return large residuals to force convergence
+                result = self.residual_func(params, *args, **kwargs)
+                return np.full_like(result, 1e10)
+        
+        return self.residual_func(params, *args, **kwargs)
+    
+    def reset(self):
+        self.start_time = None
+        self.timed_out = False
+        self.call_count = 0
+
+
+def safe_amplitude_bounds(local_peak, fallback_value):
+    """
+    Calculate safe amplitude bounds that handle negative/NaN peaks.
+    Returns (amp_value, amp_min, amp_max) that are guaranteed valid.
+    """
+    # Handle NaN or non-finite
+    if not np.isfinite(local_peak):
+        local_peak = fallback_value
+    
+    # Use absolute value for bounds calculation
+    abs_peak = np.abs(local_peak)
+    
+    # If peak is zero or negative, use fallback
+    if abs_peak <= 0:
+        abs_peak = max(np.abs(fallback_value), 1e-10)
+    
+    # For negative peaks: use 0 as minimum (as per user request)
+    if local_peak < 0:
+        amp_value = abs_peak  # Use positive version
+        amp_min = 0.0
+        amp_max = 2.0 * abs_peak
+    else:
+        amp_value = local_peak
+        amp_min = 0.2 * local_peak
+        amp_max = 1.5 * local_peak
+    
+    # Final safety: ensure min < max
+    if amp_min >= amp_max:
+        amp_max = amp_min + 1e-6
+    
+    return amp_value, amp_min, amp_max
+
 def fit_isolated_gaussian(image, xcen, ycen, all_sources_xcen, all_sources_ycen, source_id, map_struct, suffix, config, logger, logger_file_only):
+    t_fit_start = time.time()
+    timer = get_timer()
     """
     Fit a single 2D elliptical Gaussian + polynomial background to an isolated source.
 
@@ -237,11 +384,9 @@ def fit_isolated_gaussian(image, xcen, ycen, all_sources_xcen, all_sources_ycen,
                 params = Parameters()
                 local_peak = np.nanmax(cutout_masked[int(y0)-1:int(y0)+1, int(x0)-1:int(x0)+1])
                 
-                # - peak in cutout masked is well-defined after background subtraction (fit_separately = True) - #
-                if fit_separately:
-                    params.add("g_amplitude", value=local_peak, min=0.8*local_peak, max=1.3*local_peak)
-                else:
-                    params.add("g_amplitude", value=local_peak, min=0.4*local_peak, max=1.5*local_peak)
+                # Safe amplitude bounds handling negative/NaN peaks
+                amp_value, amp_min, amp_max = safe_amplitude_bounds(local_peak, median_bg)
+                params.add("g_amplitude", value=amp_value, min=amp_min, max=amp_max)
                     
                 if vary == True:
                     params.add("g_centerx", value=x0, min=x0 - 0.5, max=x0 + 0.5)
@@ -275,21 +420,28 @@ def fit_isolated_gaussian(image, xcen, ycen, all_sources_xcen, all_sources_ycen,
                     sx = p["g_sigmax"]
                     sy = p["g_sigmay"]
                     th = p["g_theta"]
+                    # 2D elliptical Gaussian with rotation angle th (measured from x-axis)
+                    # sx = sigma along major axis, sy = sigma along minor axis
+                    # Add safety for very small sigma values
+                    sx = max(sx, 1e-6)
+                    sy = max(sy, 1e-6)
                     a = (np.cos(th)**2)/(2*sx**2) + (np.sin(th)**2)/(2*sy**2)
-                    b = -np.sin(2*th)/(4*sx**2) + np.sin(2*th)/(4*sy**2)
+                    b = np.sin(2*th)/(4*sx**2) - np.sin(2*th)/(4*sy**2)  # Fixed sign error
                     c = (np.sin(th)**2)/(2*sx**2) + (np.cos(th)**2)/(2*sy**2)
-                    model = A * np.exp(- (a*(x - x0)**2 + 2*b*(x - x0)*(y - y0) + c*(y - y0)**2))
+                    
+                    # Calculate exponent with clipping to prevent overflow
+                    exponent = - (a*(x - x0)**2 + 2*b*(x - x0)*(y - y0) + c*(y - y0)**2)
+                    exponent = np.clip(exponent, -500, 0)  # Prevent exp overflow
+                    model = A * np.exp(exponent)
 
                     if fit_gauss_and_bg_together:
-                        max_order_all = max(orders)
-
-                        for dx in range(max_order_all + 1):
-                            for dy in range(max_order_all + 1 - dx):
-                                pname = f"c{dx}_{dy}"
-                                val = median_bg if (dx == 0 and dy == 0) else 1e-5
-                                params.add(pname, value=val, vary=(dx + dy <= order))
+                        for name in p:
+                            if name.startswith("c"):
+                                parts = name[1:].split("_")
+                                dx, dy = int(parts[0]), int(parts[1])
+                                model += p[name] * (x ** dx) * (y ** dy)
                                 
-                    # Final check
+                    # Final check - replace any non-finite with 0
                     model = np.where(np.isfinite(model), model, 0.0)
                     return model
 
@@ -299,7 +451,12 @@ def fit_isolated_gaussian(image, xcen, ycen, all_sources_xcen, all_sources_ycen,
                     resid = (model - data).ravel().astype(np.float64)
                     
                     if weights is not None:
+                        # Filter NaN from weights
+                        weights = np.where(np.isfinite(weights), weights, 1.0)
                         resid *= weights
+                    
+                    # Ensure no NaN in residual
+                    resid = np.where(np.isfinite(resid), resid, 0.0)
 
                     if use_l2 and fit_gauss_and_bg_together:
                         penalty_values = [
@@ -337,17 +494,69 @@ def fit_isolated_gaussian(image, xcen, ycen, all_sources_xcen, all_sources_ycen,
                 x_valid = xx.ravel()[valid]
                 y_valid = yy.ravel()[valid]
                 data_valid = cutout_masked.ravel()[valid]
-                weights_valid = weights.ravel()[valid] if weights is not None else None   
+                weights_valid = weights.ravel()[valid] if weights is not None else None
                 
-                             
-                result = minimize(
-                    residual,
-                    params,
-                    args=(x_valid.ravel(), y_valid.ravel(), data_valid),
-                    kws={'weights': weights_valid},
-                    method=fit_cfg.get("fit_method", "least_squares"),
-                    **minimize_kwargs
-                )     
+                # Filter NaN from weights and data
+                if weights_valid is not None:
+                    weights_valid = np.where(np.isfinite(weights_valid), weights_valid, 1.0)
+                data_valid = np.where(np.isfinite(data_valid), data_valid, 0.0)
+                
+                # Skip if too many NaN pixels (>50%)
+                nan_fraction = 1.0 - (np.sum(valid) / valid.size)
+                if nan_fraction > 0.5:
+                    logger_file_only.warning(f"[SKIP] Box has {nan_fraction*100:.1f}% NaN pixels, skipping")
+                    continue
+                
+                # Get fit timeout from config (default 60s for isolated sources)
+                fit_timeout = fit_cfg.get("fit_timeout", 60)
+                
+                # Run fit with timeout - retry with different initial guesses if it times out
+                result = None
+                timed_out = False
+                retry_count = 0
+                max_retries = 2
+                
+                while retry_count <= max_retries:
+                    # Create timeout wrapper for residual function (works with least_squares method)
+                    timeout_wrapper = TimeoutResidualWrapper(residual, fit_timeout, logger=logger_file_only)
+                    # Also create iter_cb for leastsq method
+                    timeout_cb = TimeoutCallback(fit_timeout, logger=logger_file_only)
+                    
+                    try:
+                        result = minimize(
+                            timeout_wrapper,
+                            params,
+                            args=(x_valid.ravel(), y_valid.ravel(), data_valid),
+                            kws={'weights': weights_valid},
+                            method=fit_cfg.get("fit_method", "least_squares"),
+                            iter_cb=timeout_cb,
+                            **minimize_kwargs
+                        )
+                        # Check both mechanisms for timeout
+                        timed_out = timeout_wrapper.timed_out or timeout_cb.timed_out
+                    except Exception as e:
+                        logger.error(f"[ERROR] Fit failed (box={cutout_masked.shape[1], cutout_masked.shape[0]}, order={order}): {e}")
+                        break
+                    
+                    if timed_out:
+                        retry_count += 1
+                        if retry_count <= max_retries:
+                            logger_file_only.warning(f"[RETRY] Retrying fit {retry_count}/{max_retries} with different initial guesses")
+                            # Modify initial guesses for retry: widen sigma bounds, perturb amplitude
+                            old_amp = params["g_amplitude"].value
+                            params["g_amplitude"].set(min=0.0, max=old_amp * 3.0)
+                            params["g_sigmax"].set(value=(aper_inf+aper_sup)/2. * (1 + 0.2*retry_count))
+                            params["g_sigmay"].set(value=(aper_inf+aper_sup)/2. * (1 + 0.2*retry_count))
+                            # Increase timeout for retry
+                            fit_timeout = int(fit_timeout * 1.5)
+                        else:
+                            logger.warning(f"[TIMEOUT] Fit timed out after {max_retries+1} attempts (box={cutout_masked.shape[1], cutout_masked.shape[0]}, order={order})")
+                            break
+                    else:
+                        break  # Fit completed successfully (or failed fast)
+                
+                if timed_out or result is None:
+                    continue     
       
                              
                 # --- Evaluate reduced chi**2, BIC and NMSE (Normalized Mean Squared Error) statistics --- #
@@ -514,6 +723,12 @@ def fit_isolated_gaussian(image, xcen, ycen, all_sources_xcen, all_sources_ycen,
             plt.close()      
 
         
+        if timer:
+            timer.log_timing("gaussfit.py", 14, 521, f"fit_isolated_gaussian (source_id={source_id})", 
+                           time.time() - t_fit_start)
         return fit_status, best_result, model_fn, best_order, best_cutout, best_slice, bg_mean, best_bg_model, best_header, best_nmse, best_redchi, best_bic
-    else:   
+    else:
+        if timer:
+            timer.log_timing("gaussfit.py", 14, 524, f"fit_isolated_gaussian FAILED (source_id={source_id})", 
+                           time.time() - t_fit_start)
         return 0, None, None, None, cutout_masked, (None, None), None, None, None, None, None, None
