@@ -1,7 +1,23 @@
+# =====================================
+# Thread limiting for worker processes
+# Must happen BEFORE scipy imports OpenBLAS
+# =====================================
 import os
+import numpy as np  # Loads OpenBLAS
+
+# Apply thread limit IMMEDIATELY after numpy loads OpenBLAS
+# This is the ONLY way to override shell-preset OMP_NUM_THREADS
+try:
+    from threadpoolctl import ThreadpoolController
+    _max_threads = int(os.environ.get('OMP_NUM_THREADS', '8'))
+    _controller = ThreadpoolController()
+    _controller.limit(limits=_max_threads, user_api='blas')
+except ImportError:
+    pass  # threadpoolctl not available
+# =====================================
+
 from pathlib import Path
 
-import numpy as np
 from astropy.coordinates import SkyCoord
 from astropy.io import ascii, fits
 from astropy.stats import SigmaClip, sigma_clipped_stats
@@ -9,20 +25,17 @@ from astropy.wcs import WCS
 
 from collections.abc import Iterable
 
-from hyper_py.paths_io import get_hyper_single_map_paths
-from hyper_py.survey import get_beam_info
-from hyper_py.map_io import read_and_prepare_map
-from hyper_py.detection import detect_sources
-from hyper_py.data_output import write_tables
-from hyper_py.groups import group_sources
-from hyper_py.photometry import aperture_photometry_on_sources
-from hyper_py.gaussfit import fit_isolated_gaussian
-from hyper_py.fitting import fit_group_with_background
-from hyper_py.visualization import plot_fit_summary
-from hyper_py.logger import setup_logger
-
-from .bkg_no_sources import masked_bkg_no_sources
-
+from hyper_py_playground.paths_io import get_hyper_single_map_paths
+from hyper_py_playground.survey import get_beam_info
+from hyper_py_playground.map_io import read_and_prepare_map
+from hyper_py_playground.detection import detect_sources
+from hyper_py_playground.data_output import write_tables
+from hyper_py_playground.groups import group_sources
+from hyper_py_playground.photometry import aperture_photometry_on_sources
+from hyper_py_playground.gaussfit import fit_isolated_gaussian
+from hyper_py_playground.fitting import fit_group_with_background
+from hyper_py_playground.visualization import plot_fit_summary
+from hyper_py_playground.logger import setup_logger
 
 
 def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=None):   
@@ -35,7 +48,7 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
     dir_root = cfg.get("paths", "output")["dir_root"]
 
     if datacube:
-        input_map_path = Path(dir_root, cfg.get("control")["dir_datacube_slices"], map_name)        
+        input_map_path = Path(dir_root, cfg.get("control")["dir_datacube_slices"], map_name)
     else:
        input_map_path = paths_dict["input_map_path"]
 
@@ -46,10 +59,9 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
     ellipses_file      = paths_dict["ellipses_file"]
     suffix = paths_dict["suffix"]
 
-    # - control & photometry - #
+    # - control - #
     detection_only = cfg.get("control", "detection_only", False) 
     fixed_radius = cfg.get("photometry", "fixed_radius", False)
-    fwhm_radius_ratio = cfg.get("photometry", "fwhm_radius_ratio", 1.0)
     
     # - params - #
     survey_code = cfg.get("survey", "survey_code")
@@ -84,8 +96,6 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
         )
     
     # initialize vectors and Table     
-    fwhm_1_val = []
-    fwhm_2_val = []
     radius_val_1 = []
     radius_val_2 = []
     PA_val = []
@@ -101,7 +111,7 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
     flux_err = []
 
 
-    fit_status_val = []
+    fit_statuts_val = []
     deblend_val = []
     cluster_val = []
 
@@ -146,19 +156,17 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
     pix_dim = map_struct["pix_dim"]
     beam_dim = map_struct["beam_dim"]
     beam_area = map_struct["beam_area_arcsec2"]    
-
+    
 
     # --- map rms used to define real sources in the map - accounting for non-zero background --- #
-    map_zero_mean_detect = real_map - np.nanmean(real_map)
-    
     use_maual_rms = cfg.get("detection", "use_manual_rms", False)
     if use_maual_rms == True:
         real_rms = cfg.get("detection", "rms_value", False)
     else:         
         sigma_clip = SigmaClip(sigma=3.0, maxiters=10)
+        map_zero_mean_detect = real_map - np.nanmean(real_map)
         clipped = sigma_clip(map_zero_mean_detect)    
         real_rms = np.sqrt(np.nanmean(clipped**2))
-    
         
         
     # --- run sources identification  --- #
@@ -242,24 +250,12 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
         # Convert to sky coordinates
         x_pixels = np.array(xcen, dtype=np.float64)
         y_pixels = np.array(ycen, dtype=np.float64)
-
-        ctype1 = header.get('CTYPE1', '').upper()
-        ctype2 = header.get('CTYPE2', '').upper()
-
-        if 'GLON' in ctype1 and 'GLAT' in ctype2:
-            # Input coordinates are Galactic
-            glon, glat = wcs.wcs_pix2world(x_pixels, y_pixels, 0)
-            skycoords = SkyCoord(l=glon, b=glat, unit='deg', frame='galactic')
-            ra = skycoords.fk5.ra.deg
-            dec = skycoords.fk5.dec.deg
-            ra_save = np.where(ra < 0., ra + 360., ra)
-        else:
-            # Assume input coordinates are Equatorial (FK5/ICRS)
-            ra, dec = wcs.wcs_pix2world(x_pixels, y_pixels, 0)
-            ra_save = np.where(ra < 0., ra + 360., ra)
-            skycoords = SkyCoord(ra=ra, dec=dec, unit='deg', frame='fk5')
-            glon = skycoords.galactic.l.deg
-            glat = skycoords.galactic.b.deg
+        ra, dec = wcs.wcs_pix2world(x_pixels, y_pixels, 0)
+        ra_save = np.where(ra < 0., ra + 360., ra)
+        
+        skycoords = SkyCoord(ra=ra, dec=dec, unit='deg', frame='icrs')
+        glon = skycoords.galactic.l.deg
+        glat = skycoords.galactic.b.deg
     
         # Prepare zeroed output table
         N = len(xcen)
@@ -342,8 +338,17 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
         sig_y = fit_result.params["g_sigmay"].value
         fwhm_x = 2.3548 * sig_x
         fwhm_y = 2.3548 * sig_y
-        theta = np.rad2deg(fit_result.params["g_theta"].value) #+90.    # rotated for photometry #
+        theta = np.rad2deg(fit_result.params["g_theta"].value)
         
+        # --- Normalize: ensure FWHM_1 >= FWHM_2 (major axis first) ---
+        # The 2D Gaussian fit has a degeneracy: (sigma_x, sigma_y, theta) and
+        # (sigma_y, sigma_x, theta+90) describe the same Gaussian. Without this
+        # normalization, FWHM_1/FWHM_2 randomly swap and PA appears 90° off.
+        if fwhm_y > fwhm_x:
+            fwhm_x, fwhm_y = fwhm_y, fwhm_x
+            theta += 90.0
+            if theta > 90.0:
+                theta -= 180.0
         
         # --- radius fixed if decided in the config file ---
         if fixed_radius:     
@@ -376,8 +381,8 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
             xcen=[fit_result.params["g_centerx"].value],  # relative coordinates inside cutout
             ycen=[fit_result.params["g_centery"].value],
             config=cfg,
-            radius_val_1=[fwhm_x * fwhm_radius_ratio],
-            radius_val_2=[fwhm_y * fwhm_radius_ratio],
+            radius_val_1=[fwhm_x],
+            radius_val_2=[fwhm_y],
             PA_val=[theta]
         )
 
@@ -388,17 +393,15 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
         yc_rel = int(round(fit_result.params["g_centery"].value))
         flux_peak_mjy_pix = source_only_map[yc_rel, xc_rel]         # in mJy/pixel           
         beam_area_pix = beam_area / (pix_dim**2)               # beam area in pixel²
-        flux_peak_mjy_beam = flux_peak_mjy_pix / beam_area_pix # → mJy/beam
+        flux_peak_mjy_beam = flux_peak_mjy_pix * beam_area_pix # → mJy/beam (multiply to convert back)
         flux_peak.append(flux_peak_mjy_beam) 
 
 
         flux.append(phot_single["flux"][0])
         flux_err.append(phot_single["error"][0])
         
-        fwhm_1_val.append(fwhm_x * pix_dim)          # save FWHM_1 value in arcsec
-        fwhm_2_val.append(fwhm_y * pix_dim)          # save FWHM_1 value in arcsec
-        radius_val_1.append(fwhm_x * fwhm_radius_ratio * pix_dim)          # save FWHM_1 value in arcsec
-        radius_val_2.append(fwhm_y * fwhm_radius_ratio * pix_dim)          # save FWHM_2 value in arcsec
+        radius_val_1.append(fwhm_x * pix_dim)          # save value in arcsec
+        radius_val_2.append(fwhm_y * pix_dim)          # save value in arcsec
         PA_val.append(theta)
         updated_xcen.append(fit_result.params["g_centerx"].value + xslice.start)
         updated_ycen.append(fit_result.params["g_centery"].value + yslice.start)
@@ -408,7 +411,7 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
         redchi_val.append(final_redchi)
         bic_val.append(final_bic)
         
-        fit_status_val.append(fit_status)
+        fit_statuts_val.append(fit_status)
         deblend_val.append(0)       # not deblended
         cluster_val.append(1)       # only one source
         
@@ -425,6 +428,11 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
     group_counter = 0
     total_groups = len(set([tuple(sorted(common_group[i][common_group[i] >= 0])) for i in blended]))
     
+    # Maximum group size limit - 0 means no limit (all groups will be attempted)
+    # Groups exceeding this limit will still be included in output with fit_status=0
+    max_group_size = cfg.get("fit_options", "max_group_size", 0)
+    skip_large_groups = cfg.get("fit_options", "skip_large_groups", False)
+    
     count_blended_sources = 0
     for i in blended:
         group_indices = common_group[i]
@@ -436,6 +444,37 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
     
         seen_groups.add(group_key)
         group_counter += 1
+        
+        # Check group size and optionally skip (but still include sources in output)
+        if max_group_size > 0 and len(group_indices) > max_group_size:
+            if skip_large_groups:
+                logger.warning(f"⚠️ Skipping group {group_counter} with {len(group_indices)} sources (max_group_size={max_group_size}). "
+                              f"Sources {tuple(group_indices)} will use default estimates.")
+                logger_file_only.warning(f"Group {group_counter} skipped: {len(group_indices)} sources exceeds max_group_size={max_group_size}")
+                # Mark these sources with fit_status=0 and NaN values so they still appear in output
+                for idx in group_indices:
+                    source_id_save.append(int(idx) + 1)
+                    updated_xcen.append(float(xcen[idx]))
+                    updated_ycen.append(float(ycen[idx]))
+                    updated_ra.append(float(ra[idx]))
+                    updated_dec.append(float(dec[idx]))
+                    fwhm_major_list.append(np.nan)
+                    fwhm_minor_list.append(np.nan)
+                    angle_list.append(np.nan)
+                    amplitude_list.append(np.nan)
+                    flux_list.append(np.nan)
+                    bg_val.append(np.nan)
+                    nmse_val.append(np.nan)
+                    redchi_val.append(np.nan)
+                    bic_val.append(np.nan)
+                    fit_statuts_val.append(0)  # fit skipped
+                    deblend_val.append(1)
+                    cluster_val.append(len(group_indices))
+                count_blended_sources += len(group_indices)
+                continue
+            else:
+                logger.warning(f"⚠️ Large group {group_counter} with {len(group_indices)} sources (max_group_size={max_group_size}). "
+                              f"Attempting fit anyway - timeout will handle stuck fits.")
         
         #- counts indexes for plots -#
         count_source_blended_indexes = (tot_fitted_isolated + count_blended_sources +1, tot_fitted_isolated + count_blended_sources +len(group_indices))
@@ -505,6 +544,13 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
             fwhm_y = 2.3548 * sig_y
             theta = np.rad2deg(fit_result.params[f"g{j}_theta"].value)
             
+            # --- Normalize: ensure FWHM_1 >= FWHM_2 (major axis first) ---
+            if fwhm_y > fwhm_x:
+                fwhm_x, fwhm_y = fwhm_y, fwhm_x
+                theta += 90.0
+                if theta > 90.0:
+                    theta -= 180.0
+            
             # --- radius fixed if decided in the config file ---
             if fixed_radius == True:
                 fwhm_x = fwhm_x_group[j] 
@@ -519,8 +565,8 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
                 xcen=[fit_result.params[f"g{j}_x0"].value], 
                 ycen=[fit_result.params[f"g{j}_y0"].value],
                 config=cfg,
-                radius_val_1=[fwhm_x * fwhm_radius_ratio],
-                radius_val_2=[fwhm_y * fwhm_radius_ratio],
+                radius_val_1=[fwhm_x],
+                radius_val_2=[fwhm_y],
                 PA_val=[theta]
             )
             
@@ -572,16 +618,14 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
             yc_rel = int(round(fit_result.params[f"g{j}_y0"].value))
             flux_peak_mjy_pix = source_only_map[yc_rel, xc_rel]         # in mJy/pixel       
             beam_area_pix = beam_area / (pix_dim**2)               # beam area in pixel²
-            flux_peak_mjy_beam = flux_peak_mjy_pix / beam_area_pix # → mJy/beam
+            flux_peak_mjy_beam = flux_peak_mjy_pix * beam_area_pix # → mJy/beam (multiply to convert back)
             flux_peak.append(flux_peak_mjy_beam) 
                                            
             flux.append(phot_res["flux"][0])
             flux_err.append(phot_res["error"][0])
 
-            fwhm_1_val.append(fwhm_x * pix_dim)          # save FWHM_1 value in arcsec
-            fwhm_2_val.append(fwhm_y * pix_dim)          # save FWHM_2 value in arcsec
-            radius_val_1.append(fwhm_x * fwhm_radius_ratio * pix_dim)          # save FWHM_1 value in arcsec
-            radius_val_2.append(fwhm_y * fwhm_radius_ratio * pix_dim)          # save FWHM_2 value in arcsec
+            radius_val_1.append(fwhm_x * pix_dim)        # save value in arcsec
+            radius_val_2.append(fwhm_y * pix_dim)        # save value in arcsec
             PA_val.append(theta)
             updated_xcen.append(fit_result.params[f"g{j}_x0"].value + x0_global)
             updated_ycen.append(fit_result.params[f"g{j}_y0"].value + y0_global)
@@ -592,7 +636,7 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
             redchi_val.append(final_redchi)
             bic_val.append(final_bic)
             
-            fit_status_val.append(fit_status)
+            fit_statuts_val.append(fit_status)
             deblend_val.append(1)                   # multi-Gaussian fit
             cluster_val.append(len(group_indices))  # number of sources in the group
             
@@ -610,31 +654,18 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
             
     # Assuming you have your WCS object (usually from your FITS header)
     header = map_struct["header"]
+    # Convert pixel coordinates to sky coordinates (RA, Dec)
     x_pixels = np.array(updated_xcen, dtype=np.float64)
     y_pixels = np.array(updated_ycen, dtype=np.float64)
     
     # Initialize WCS from header
     wcs = WCS(header)
-
-    # Detect coordinate type from header
-    ctype1 = header.get('CTYPE1', '').upper()
-    ctype2 = header.get('CTYPE2', '').upper()
-
-    if 'GLON' in ctype1 and 'GLAT' in ctype2:
-        # Input coordinates are Galactic
-        glon, glat = wcs.wcs_pix2world(x_pixels, y_pixels, 0)
-        # Convert to FK5 (RA/Dec)
-        skycoords = SkyCoord(l=glon, b=glat, unit='deg', frame='galactic')
-        ra = skycoords.fk5.ra.deg
-        dec = skycoords.fk5.dec.deg
-        ra_save = np.where(ra < 0., ra + 360., ra)
-    else:
-        # Assume input coordinates are Equatorial (FK5/ICRS)
-        ra, dec = wcs.wcs_pix2world(x_pixels, y_pixels, 0)
-        ra_save = np.where(ra < 0., ra + 360., ra)
-        skycoords = SkyCoord(ra=ra, dec=dec, unit='deg', frame='fk5')
-        glon = skycoords.galactic.l.deg
-        glat = skycoords.galactic.b.deg
+    ra, dec = wcs.wcs_pix2world(x_pixels, y_pixels, 0)
+    ra_save = np.where(ra < 0., ra + 360., ra)
+        
+    skycoords = SkyCoord(ra=ra, dec=dec, unit='deg', frame='icrs')
+    glon = skycoords.galactic.l.deg
+    glat = skycoords.galactic.b.deg
 
 
 ######################## Write Table after photometry ########################
@@ -673,10 +704,10 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
             "NMSE": list(nmse_val),
             "CHI2_RED": list(redchi_val),
             "BIC": list(bic_val),
-            "FWHM_1": list(fwhm_1_val),
-            "FWHM_2": list(fwhm_2_val),
+            "FWHM_1": list(radius_val_1),
+            "FWHM_2": list(radius_val_2),
             "PA": list(PA_val),
-            "STATUS": list(fit_status_val),
+            "STATUS": list(fit_statuts_val),
             "GLON": list(glon),
             "GLAT": list(glat),
             "RA": list(ra_save),
@@ -741,55 +772,12 @@ def main(map_name=None, cfg=None, dir_root=None, logger=None, logger_file_only=N
     if bg_model is not None:    
         return map_name, bg_model, cutout_header, header
     else:
-        pol_orders_bkg_no_sources = cfg.get("background", "pol_orders_bkg_no_sources", [0])  # only if fit_separately
-
-        if pol_orders_bkg_no_sources == [0]:
-            valid_real_map_nobg = ~np.isnan(real_map)        
-            mean_valid_real_map_nobg, median_valid_real_map_nobg, std_valid_real_map_nobg = sigma_clipped_stats(real_map[valid_real_map_nobg], sigma=3.0, maxiters=5)
-            real_map_nobg = np.full_like(real_map, median_valid_real_map_nobg)
-            real_map_nobg[np.isnan(real_map)] = np.nan        
-            bg_model = real_map_nobg
-            return map_name, bg_model, header, header
-        else:
-            minimize_method = cfg.get("fit_options", "min_method", "redchi")
-            beam_pix = map_struct['beam_dim']/pix_dim/2.3548      # beam sigma size in pixels    
-            fwhm_beam_pix = beam_pix * 2.3548    # beam FWHM size in pixels    
-            aper_sup = cfg.get("photometry", "aper_sup", 2.0) * beam_pix
-            max_fwhm_extent = aper_sup * 2.3548  # twice major FWHM in pixels
-
-            fix_min_box = cfg.get("background", "fix_min_box", 3)     # minimum padding value (multiple of FWHM)
-            fix_max_box = cfg.get("background", "fix_max_box", 5)     # maximum padding value (multiple of FWHM)
-
-            # === Determine box size ===
-            ny, nx = real_map.shape
-            if fix_min_box == 0:
-                # Use entire map size directly
-                box_sizes = list((ny, nx))
-            else:
-                # Standard logic for square box sizes (in pixels)
-                dynamic_min_box = int(np.ceil(fix_min_box * fwhm_beam_pix) * 2 + max_fwhm_extent * 2)
-                dynamic_max_box = int(np.ceil(fix_max_box * fwhm_beam_pix) * 2 + max_fwhm_extent * 2)
-                box_sizes = list(range(dynamic_min_box + 1, dynamic_max_box + 2, 2))  # ensure odd
-
-            real_map_after_bg, real_map_full_with_bg, cutout_header, bg_model, mask_bg, back_order, poly_params = masked_bkg_no_sources(
-                minimize_method,
-                real_map,
-                header,
-                nx,
-                ny,
-                max_fwhm_extent,
-                box_sizes,
-                pol_orders_bkg_no_sources,
-                cfg,
-                logger,
-                logger_file_only
-            )
-
-            return map_name, bg_model, header, header
-
-
-
-
+        valid_real_map_nobg = ~np.isnan(real_map)        
+        mean_valid_real_map_nobg, median_valid_real_map_nobg, std_valid_real_map_nobg = sigma_clipped_stats(real_map[valid_real_map_nobg], sigma=3.0, maxiters=5)
+        real_map_nobg = np.full_like(real_map, median_valid_real_map_nobg)
+        real_map_nobg[np.isnan(real_map)] = np.nan        
+        bg_model = real_map_nobg
+        return map_name, bg_model, header, header
     
 #################################### MAIN CALL ####################################
 if __name__ == "__main__":
