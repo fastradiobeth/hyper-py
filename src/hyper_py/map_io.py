@@ -38,13 +38,10 @@ def read_and_prepare_map(filepath, beam, beam_area_arcsec2, beam_area_sr, conver
     pix_dim = abs(header.get('CDELT1', header.get('CD1_1', 1))) * 3600.0  # arcsec
     if pix_dim <= 0:
         raise ValueError("Invalid pixel scale in FITS header.")
-        
-    # --- Store the channel index in the header, which is removed below
-    chan_n_key=False
-    if 'CHAN_N' in header.keys():
-        mychan = header['CHAN_N']
-        chan_n_key = True
- 
+    
+    # --- Save BUNIT before cleaning header (it gets lost in WCS conversion) ---
+    bunit = header.get('BUNIT')
+
     # --- Strip header down to 2D WCS only ---
     try:
         wcs_full = WCS(header)
@@ -52,16 +49,10 @@ def read_and_prepare_map(filepath, beam, beam_area_arcsec2, beam_area_sr, conver
         header = wcs_2d.to_header()
     except Exception as e:
         print(f"[WARNING] Could not clean WCS header: {e}")
-    
-    # --- Add again to the header the channel index needed to reorder the background for cubes
-    if chan_n_key:
-        header['CHAN_N'] = (mychan, 'Original channel index')
+
 
     # --- Unit conversions ---
-    header_for_units = hdul[0].header
-    bunit = header_for_units.cards['BUNIT'].value
-
-    if bunit == 'MJy/sr' or bunit == 'MJy / sr':
+    if bunit == 'MJy /sr':
         arcsec_to_rad = np.pi / (180.0 * 3600.0)
         pix_area_sr = (pix_dim * arcsec_to_rad)**2
         image_data *= 1e6 * pix_area_sr  # MJy/sr to Jy/pixel
