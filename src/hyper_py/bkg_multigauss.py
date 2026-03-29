@@ -162,9 +162,16 @@ def multigauss_background(minimize_method, image, header, xcen, ycen, nx, ny, al
                 threshold_factor = 0.1353
                 max_fraction = 0.3
                 max_extent_pix = max_fwhm_extent *2  # in pixels
+                max_loop_iterations = 50  # Safety limit to prevent infinite loops
+                
+                # Safety check: if amplitude is non-positive or NaN, skip masking this source
+                if not np.isfinite(g_fit.amplitude.value) or g_fit.amplitude.value <= 0:
+                    continue
                 
                 # Loop to find acceptable threshold
-                while True:
+                loop_count = 0
+                while loop_count < max_loop_iterations:
+                    loop_count += 1
                     threshold = g_fit.amplitude.value * threshold_factor
                     mask_above = model_vals > threshold
                     frac_above_thresh = np.sum(mask_above) / model_vals.size
@@ -298,9 +305,16 @@ def multigauss_background(minimize_method, image, header, xcen, ycen, nx, ny, al
             threshold_factor = 0.1353
             max_fraction = 0.3
             max_extent_pix = max_fwhm_extent *2  # in pixels
+            max_loop_iterations = 50  # Safety limit to prevent infinite loops
+            
+            # Safety check: if amplitude is non-positive or NaN, skip masking this source
+            if not np.isfinite(g_fit.amplitude.value) or g_fit.amplitude.value <= 0:
+                continue
             
             # Loop to find acceptable threshold
-            while True:
+            loop_count = 0
+            while loop_count < max_loop_iterations:
+                loop_count += 1
                 threshold = g_fit.amplitude.value * threshold_factor
                 mask_above = model_vals > threshold
                 frac_above_thresh = np.sum(mask_above) / model_vals.size
