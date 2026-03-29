@@ -21,6 +21,15 @@ files:
 control:
   parallel_maps: true                   # [REQUIRED] Enable parallel execution over multiple maps (True/False). Default: True
   n_cores: 2                            # [REQUIRED] Number of CPU cores to use for multiprocessing - better <= tot maps. Default: 2
+  max_total_threads: 50                 # [ADVANCED] Maximum total CPU threads across all workers. Default: 50
+                                        #            Each worker gets max_total_threads / n_cores threads for numpy/scipy.
+                                        #            Prevents oversubscription on shared servers.
+  parallel_mode: "maps"                 # [ADVANCED] Parallelization strategy: "maps" or "sources". Default: "maps"
+                                        #            "maps": Process different maps in parallel (original behavior)
+                                        #            "sources": Process sources within each map in parallel (intra-map)
+                                        #            Use "sources" when you have few maps with many sources.
+  map_timeout_minutes: 0                # [ADVANCED] Timeout per map in minutes (0 = no timeout). Default: 0
+                                        #            Maps exceeding this time are skipped. Useful to prevent stuck jobs.
   detection_only: false                 # [REQUIRED] Only perform source detection without photometry (True/False). Default: False
   datacube: false                       # [REQUIRED] Select if the input map is a datacube. Default: False
   
@@ -59,11 +68,17 @@ detection:
   
   use_manual_rms: false                         # [OPTIONAL] Use manually provided RMS noise value to identify sources (True/False). Default: False
   rms_value: 1.e-6                              # [OPTIONAL] Manual RMS noise value (Jy) (only if use_manual_rms = true). Default: 1.e-6
-
-  kernel_size_pix: 5                            # [OPTIONAL] Size of the high-pass filter kernel in pixels (odd integer; if 0, it is set to FWHM_pix).  Default: 0 
   
   roundlim: [-4.0, 4.0]                         # [ADVANCED] Allowed source roundness range (min, max for DAOFIND). Default: [-4.0, 4.0]
   sharplim: [-2.0, 2.0]                         # [ADVANCED] Allowed source sharpness range (min, max for DAOFIND). Default: [-2.0, 2.0]
+  
+  local_max_radius: 0.5                         # [ADVANCED] Source must be brightest within this many FWHMs (0 = disabled). Default: 0.0
+                                                #            Helps reject secondary peaks on halos/extended emission.
+                                                #            Suggested values: 1.5-3.0 FWHMs
+  local_max_steepness: 0.01                      # [ADVANCED] Required fractional flux drop at edge of local_max_radius (0 = disabled). Default: 0.0
+                                                #            E.g., 0.5 means flux at edge must drop to ≤50% of peak.
+                                                #            Rejects sources sitting on "pedestals" of extended emission.
+                                                #            Suggested values: 0.3-0.7
   
   use_fixed_source_table: false                 # [OPTIONAL] If True, use an external IPAC table for peak + aperture. Default: False
   fixed_source_table_path: "source_table.txt"   # [OPTIONAL] IPAC table with 6 columns: ID, RA, DEC, FWHM_1, FWHM_2, PA (in dir_root). Default: "source_table.txt"
@@ -76,8 +91,7 @@ detection:
 photometry:
   aper_inf: 1.0                          # [REQUIRED] Minimum size factor for Gaussian FWHM (used as minimum radius). Default: 1.0
   aper_sup: 2.0                          # [REQUIRED] Maximum size factor for Gaussian FWHM (used as maximum radius). Default: 2.0
-  fwhm_radius_ratio: 1.0                 # [OPTIONAL] Ratio between fitted FWHM and source radius. Default: 1.0 (FWHM = radius)
-
+  
   fixed_radius: false                    # [OPTIONAL] Use fixed aperture radii instead of Gaussian fitting (True/False). Default: False
   fwhm_1: [0.0]                          # [OPTIONAL] Fixed FWHM aperture radius major axis (arcsec; only if radius_fix = true). Default: [0.0]
   fwhm_2: [0.0]                          # [OPTIONAL] Fixed FWHM aperture radius minor axis (arcsec; only if radius_fix = true). Default: [0.0]
@@ -118,7 +132,6 @@ background:
   fit_gauss_and_bg_together: false       # [REQUIRED] Enable polynomial background subtraction and Gaussian fit simultaneously (True/False). Default: False
   polynomial_orders: [0]                 # [OPTIONAL] Polynomial background orders for the main Gaussian + background fitting (0,1,2,3, etc.). Default: [0]
 
-  pol_orders_bkg_no_sources: [0]         # [OPTIONAL] Polynomial background orders used to model the background map when no sources are identified in the field. Default: [0]
 
 #--------------------- Fits output Options ---------------------#
 fits_output:                                    # Save Fits files for best fits
