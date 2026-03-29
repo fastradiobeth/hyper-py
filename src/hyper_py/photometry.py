@@ -33,7 +33,8 @@ def aperture_photometry_on_sources(image, xcen, ycen, config,
     for i in range(len(xcen)):   
         a = radius_val_1[i]
         b = radius_val_2[i]
-        theta = np.deg2rad(PA_val[i] + 90.)  # rotated only for photometry (x and y axes inverted here)
+        # PA_val is in degrees from x-axis counterclockwise (same as photutils convention)
+        theta = np.deg2rad(PA_val[i])
         
         position = (xcen[i], ycen[i])
         aperture = EllipticalAperture(position, a, b, theta=theta)
@@ -58,8 +59,8 @@ def aperture_photometry_on_sources(image, xcen, ycen, config,
         else:
             error = 0.0
 
-        fluxes.append(flux)
-        errors.append(error)
+        fluxes.append(float(flux[0]))
+        errors.append(float(error))
 
     return Table(data={"x": xcen, "y": ycen, "flux": fluxes, "error": errors})
 
