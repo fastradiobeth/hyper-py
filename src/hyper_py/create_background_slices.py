@@ -1,18 +1,9 @@
-def create_background_cubes(map_name, input_background_slices, input_slice_cutout_header, cube_header, 
-                            beam_area_arcsec2_datacubes, dir_slices_out, fix_min_box, convert_mjy, logger):
+def create_background_cubes(background_slices, slice_cutout_header, cube_header, dir_slices_out, fix_min_box, convert_mjy, logger):
     
     import os
     import numpy as np
     from astropy.io import fits
     from astropy.wcs import WCS
-
-    # 0. Reorder using the sequential channel numbers the backgrounds and headers 
-    channel_index_slices = [s['CHAN_N']-1 for s in input_slice_cutout_header]
-    reorder = np.argsort(channel_index_slices)
-    background_slices = [input_background_slices[i] for i in reorder]
-    slice_cutout_header = [input_slice_cutout_header[i] for i in reorder]
-    del input_background_slices, input_slice_cutout_header
-    chan_start_cube = slice_cutout_header[0]['CHAN_N']
     
     # 1. Determine common crop size
     all_shapes = [bg.shape for bg in background_slices]
@@ -101,30 +92,12 @@ def create_background_cubes(map_name, input_background_slices, input_slice_cutou
     
     # 11. Ensure WCSAXES is at least 3
     new_header['WCSAXES'] = max(new_header.get('WCSAXES', 3), 3)
-
-    # 12. Add to the cube the starting channel in case extract cubes is modified and do not take all the cube channels
-    new_header['START_CH'] = (chan_start_cube, 'Channel in the original input cube that corresponds to chan 1 in this cube')
-    if chan_start_cube !=1:
-        new_header['CRPIX3'] = cube_header['CRPIX3'] - chan_start_cube +1 # to use CRVAL3 from the original cube 
-
-    # --- Unit conversions (back to original header Units) ---
-    header_for_units = new_header
-    bunit = header_for_units.cards['BUNIT'].value
-    pix_dim = abs(header_for_units.get('CDELT1', header_for_units.get('CD1_1', 1))) * 3600.0  # arcsec
-
-    if bunit == 'MJy/sr' or bunit == 'MJy / sr':
-        arcsec_to_rad = np.pi / (180.0 * 3600.0)
-        pix_area_sr = (pix_dim * arcsec_to_rad)**2 * 1e6
-        bg_cube /= pix_area_sr  # Jy/pixel tp MJy/sr
     
-    if bunit == 'Jy/beam' or bunit == 'beam-1 Jy':    
-        pix_area = pix_dim**2
-        bg_cube *= (beam_area_arcsec2_datacubes / pix_area) #  Jy/pixel to Jy/beam
-    
+    # update units header 
     if convert_mjy:
-        bg_cube /= 1e3  # mJy → Jy  
-
-
+        new_header['BUNIT'] = 'mJy'
+    else:
+        new_header['BUNIT'] = 'Jy'
     
     # Optional: clean inconsistent axis-specific keys (e.g., if 4D originally)
     for ax in [4, 5]:
@@ -133,8 +106,7 @@ def create_background_cubes(map_name, input_background_slices, input_slice_cutou
             if key in new_header:
                 del new_header[key]
 
-    new_name = os.path.basename(map_name).split('_slice')[0]
-    output_cube_path = os.path.join(dir_slices_out, new_name + "_background_cube_cut.fits")
+    output_cube_path = os.path.join(dir_slices_out, "background_cube_cut.fits")
     fits.PrimaryHDU(data=bg_cube, header=new_header).writeto(output_cube_path, overwrite=True)
     logger.info(f"📦 Background cube saved to: {output_cube_path}")
 
@@ -143,9 +115,8 @@ def create_background_cubes(map_name, input_background_slices, input_slice_cutou
     xcen_all = []
     ycen_all = []
     
-    for myindex in range(0, np.shape(slice_cutout_header)[0]):
-        hdr = slice_cutout_header[myindex]
-        ny, nx = background_slices[myindex].shape
+    for hdr in slice_cutout_header:
+        ny, nx = cropped_bgs[0].shape
         x_c = nx / 2.0
         y_c = ny / 2.0
         wcs_cutout = WCS(hdr, naxis=2)
@@ -178,38 +149,12 @@ def create_background_cubes(map_name, input_background_slices, input_slice_cutou
         padded_header['NAXIS2'] = full_ny
         padded_header['NAXIS3'] = bg_cube_full.shape[0]
         padded_header['WCSAXES'] = max(padded_header.get('WCSAXES', 3), 3)
-        
-        # 12. Add to the cube the starting channel in case extract cubes is modified and do not take all the cube channels
-        padded_header['START_CH'] = (chan_start_cube, 'Channel in the original input cube that corresponds to chan 1 in this cube')
-        if chan_start_cube !=1:
-            new_header['CRPIX3'] = padded_header['CRPIX3'] - chan_start_cube +1 # to use CRVAL3 from the original cube 
- 
-
-        # --- Unit conversions (back to original header Units) ---
-        header_for_units = padded_header
-        bunit = header_for_units.cards['BUNIT'].value
-        pix_dim = abs(header_for_units.get('CDELT1', header_for_units.get('CD1_1', 1))) * 3600.0  # arcsec
-
-        if bunit == 'MJy/sr' or bunit == 'MJy / sr':
-            arcsec_to_rad = np.pi / (180.0 * 3600.0)
-            pix_area_sr = (pix_dim * arcsec_to_rad)**2 * 1e6
-            bg_cube_full /= pix_area_sr  # Jy/pixel tp MJy/sr
-        
-        if bunit == 'Jy/beam' or bunit == 'beam-1 Jy':    
-            pix_area = pix_dim**2
-            bg_cube_full *= (beam_area_arcsec2_datacubes / pix_area) #  Jy/pixel to Jy/beam
-        
-        if convert_mjy:
-            bg_cube_full /= 1e3  # mJy → Jy 
- 
-
-        
+        padded_header['BUNIT'] = 'mJy' if convert_mjy else 'Jy'
         for ax in [4, 5]:
             for prefix in ['CTYPE', 'CRPIX', 'CRVAL', 'CDELT', 'CUNIT']:
                 key = f"{prefix}{ax}"
                 if key in padded_header:
                     del padded_header[key]
-        output_cube_full_path = os.path.join(dir_slices_out, new_name + "_background_cube_fullsize.fits")
-
+        output_cube_full_path = os.path.join(dir_slices_out, "background_cube_fullsize.fits")
         fits.PrimaryHDU(data=bg_cube_full, header=padded_header).writeto(output_cube_full_path, overwrite=True)
         logger.info(f"📦 Full-size background cube saved to: {output_cube_full_path}")
