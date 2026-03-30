@@ -1,5 +1,7 @@
 import os
 import warnings
+import time
+import threading
 
 import numpy as np
 from astropy.io import fits
@@ -13,15 +15,160 @@ from photutils.aperture import CircularAperture
 from sklearn.linear_model import HuberRegressor, TheilSenRegressor
 from scipy.ndimage import gaussian_filter
 
-from hyper_py.visualization import plot_fit_summary
+from hyper_py_playground.visualization import plot_fit_summary
+from hyper_py_playground.performance_timer import get_timer
 from .bkg_multigauss import multigauss_background
 
 from scipy.spatial.distance import pdist
 import matplotlib.pyplot as plt
 
 
+def run_with_timeout(func, args, kwargs, timeout_seconds):
+    """
+    Run a function with a timeout. Returns (result, timed_out).
+    If timed out, result is None and timed_out is True.
+    
+    NOTE: This uses threading which doesn't reliably kill scipy/numpy operations.
+    For lmfit, use the iter_cb callback approach instead.
+    """
+    result = [None]
+    exception = [None]
+    
+    def target():
+        try:
+            result[0] = func(*args, **kwargs)
+        except Exception as e:
+            exception[0] = e
+    
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout_seconds)
+    
+    if thread.is_alive():
+        return None, True  # Timed out
+    
+    if exception[0] is not None:
+        raise exception[0]
+    
+    return result[0], False
+
+
+class TimeoutCallback:
+    """
+    Callback class for lmfit minimize that aborts fitting after a timeout.
+    Returns True to abort, False to continue.
+    """
+    def __init__(self, timeout_seconds, logger=None):
+        self.timeout_seconds = timeout_seconds
+        self.start_time = None
+        self.logger = logger
+        self.timed_out = False
+        self.iteration_count = 0
+        
+    def __call__(self, params, iter, resid, *args, **kws):
+        if self.start_time is None:
+            self.start_time = time.time()
+        
+        self.iteration_count += 1
+        elapsed = time.time() - self.start_time
+        
+        # Check every 10 iterations to reduce overhead
+        if self.iteration_count % 10 == 0:
+            if elapsed > self.timeout_seconds:
+                self.timed_out = True
+                if self.logger:
+                    self.logger.warning(f"[TIMEOUT] Fit exceeded {self.timeout_seconds}s (iter={iter}, elapsed={elapsed:.1f}s)")
+                return True  # Abort fitting
+        
+        return False  # Continue fitting
+    
+    def reset(self):
+        self.start_time = None
+        self.timed_out = False
+        self.iteration_count = 0
+
+
+class FitTimeoutError(Exception):
+    """Custom exception raised when fit times out."""
+    pass
+
+
+class TimeoutResidualWrapper:
+    """
+    Wrapper around residual function that checks for timeout on each call.
+    Works with least_squares which calls residual function frequently.
+    """
+    def __init__(self, residual_func, timeout_seconds, logger=None):
+        self.residual_func = residual_func
+        self.timeout_seconds = timeout_seconds
+        self.start_time = None
+        self.logger = logger
+        self.timed_out = False
+        self.call_count = 0
+        
+    def __call__(self, params, *args, **kwargs):
+        if self.start_time is None:
+            self.start_time = time.time()
+        
+        self.call_count += 1
+        
+        # Check timeout every 10 calls to ensure responsive timeout
+        if self.call_count % 10 == 0:
+            elapsed = time.time() - self.start_time
+            if elapsed > self.timeout_seconds:
+                self.timed_out = True
+                if self.logger:
+                    self.logger.warning(f"[TIMEOUT] Fit exceeded {self.timeout_seconds}s (calls={self.call_count}, elapsed={elapsed:.1f}s)")
+                # Return large residuals to force convergence
+                result = self.residual_func(params, *args, **kwargs)
+                return np.full_like(result, 1e10)
+        
+        return self.residual_func(params, *args, **kwargs)
+    
+    def reset(self):
+        self.start_time = None
+        self.timed_out = False
+        self.call_count = 0
+
+
+def safe_amplitude_bounds(local_peak, fallback_value):
+    """
+    Calculate safe amplitude bounds that handle negative/NaN peaks.
+    Returns (amp_value, amp_min, amp_max) that are guaranteed valid.
+    """
+    # Handle NaN or non-finite
+    if not np.isfinite(local_peak):
+        local_peak = fallback_value
+    
+    # Use absolute value for bounds calculation, keep original for value
+    abs_peak = np.abs(local_peak)
+    
+    # If peak is zero or negative, use fallback
+    if abs_peak <= 0:
+        abs_peak = max(np.abs(fallback_value), 1e-10)
+    
+    # For negative peaks: use 0 as minimum (as per user request)
+    if local_peak < 0:
+        amp_value = abs_peak  # Use positive version
+        amp_min = 0.0
+        amp_max = 2.0 * abs_peak
+    else:
+        amp_value = local_peak
+        amp_min = 0.2 * local_peak
+        amp_max = 1.5 * local_peak
+    
+    # Final safety: ensure min < max
+    if amp_min >= amp_max:
+        amp_max = amp_min + 1e-6
+    
+    return amp_value, amp_min, amp_max
+
+
 def fit_group_with_background(image, xcen, ycen, all_sources_xcen, all_sources_ycen, group_indices, map_struct, config, 
                               suffix, logger, logger_file_only, group_id, count_source_blended_indexes):
+    t_fit_start = time.time()
+    timer = get_timer()
     
     header = map_struct['header']
     ny, nx = image.shape
@@ -238,11 +385,9 @@ def fit_group_with_background(image, xcen, ycen, all_sources_xcen, all_sources_y
                     prefix = f"g{i}_"
                     local_peak = np.nanmax(cutout_masked[int(yc)-1:int(yc)+1, int(xc)-1:int(xc)+1])
                     
-                    # - peak in cutout masked is well-defined after background subtraction (fit_separately = True) - #
-                    if fit_separately:
-                        params.add(f"{prefix}amplitude", value=local_peak, min=0.4*local_peak, max=1.3*local_peak)
-                    else:
-                        params.add(f"{prefix}amplitude", value=local_peak, min=0.2*local_peak, max=1.5*local_peak)
+                    # Safe amplitude bounds handling negative/NaN peaks
+                    amp_value, amp_min, amp_max = safe_amplitude_bounds(local_peak, median_bg)
+                    params.add(f"{prefix}amplitude", value=amp_value, min=amp_min, max=amp_max)
                         
                     if vary == True:
                         params.add(f"{prefix}x0", value=xc, min=xc - 1, max=xc + 1)
@@ -279,21 +424,28 @@ def fit_group_with_background(image, xcen, ycen, all_sources_xcen, all_sources_y
                         sx = p[f"{prefix}sx"]
                         sy = p[f"{prefix}sy"]
                         th = p[f"{prefix}theta"]
+                        # 2D elliptical Gaussian with rotation angle th (measured from x-axis)
+                        # sx = sigma along major axis, sy = sigma along minor axis
+                        # Add safety for very small sigma values
+                        sx = max(sx, 1e-6)
+                        sy = max(sy, 1e-6)
                         a = (np.cos(th)**2)/(2*sx**2) + (np.sin(th)**2)/(2*sy**2)
-                        b = -np.sin(2*th)/(4*sx**2) + np.sin(2*th)/(4*sy**2)
+                        b = np.sin(2*th)/(4*sx**2) - np.sin(2*th)/(4*sy**2)  # Fixed sign error
                         c = (np.sin(th)**2)/(2*sx**2) + (np.cos(th)**2)/(2*sy**2)
-                        model += A * np.exp(- (a*(x - x0)**2 + 2*b*(x - x0)*(y - y0) + c*(y - y0)**2))
+                        
+                        # Calculate exponent with clipping to prevent overflow
+                        exponent = - (a*(x - x0)**2 + 2*b*(x - x0)*(y - y0) + c*(y - y0)**2)
+                        exponent = np.clip(exponent, -500, 0)  # Prevent exp overflow
+                        model += A * np.exp(exponent)
 
                     if fit_gauss_and_bg_together:
-                        max_order_all = max(orders)
-
-                        for dx in range(max_order_all + 1):
-                            for dy in range(max_order_all + 1 - dx):
-                                pname = f"c{dx}_{dy}"
-                                val = median_bg if (dx == 0 and dy == 0) else 1e-5
-                                params.add(pname, value=val, vary=(dx + dy <= order))
+                        for name in p:
+                            if name.startswith("c"):
+                                parts = name[1:].split("_")
+                                dx, dy = int(parts[0]), int(parts[1])
+                                model += p[name] * (x ** dx) * (y ** dy)
                                 
-                    # Final check
+                    # Final check - replace any non-finite with 0
                     model = np.where(np.isfinite(model), model, 0.0)
                     return model
                 
@@ -303,10 +455,13 @@ def fit_group_with_background(image, xcen, ycen, all_sources_xcen, all_sources_y
                     resid = np.asarray(model - data, dtype=np.float64)  # Ensure float array
                 
                     if weights is not None:
+                        # Filter NaN from weights
+                        weights = np.where(np.isfinite(weights), weights, 1.0)
                         resid *= weights
                 
-                    # Ensure residual is a clean float64 array
+                    # Ensure residual is a clean float64 array with no NaN/inf
                     resid = np.asarray(resid, dtype=np.float64).ravel()
+                    resid = np.where(np.isfinite(resid), resid, 0.0)
                     
                     if use_l2 and fit_gauss_and_bg_together:
                         penalty_values = [
@@ -345,15 +500,72 @@ def fit_group_with_background(image, xcen, ycen, all_sources_xcen, all_sources_y
                 y_valid = yy.ravel()[valid.ravel()]
                 data_valid = cutout_masked.ravel()[valid.ravel()]
                 weights_valid = weights.ravel()[valid.ravel()] if weights is not None else None
-
-                result = minimize(
-                    residual,
-                    params,
-                    args=(x_valid.ravel(), y_valid.ravel(), data_valid),
-                    kws={'weights': weights_valid},
-                    method=fit_cfg.get("fit_method", "leastsq"),
-                    **minimize_kwargs
-                )     
+                
+                # Filter NaN from weights and data
+                if weights_valid is not None:
+                    weights_valid = np.where(np.isfinite(weights_valid), weights_valid, 1.0)
+                data_valid = np.where(np.isfinite(data_valid), data_valid, 0.0)
+                
+                # Skip if too many NaN pixels (>50%)
+                nan_fraction = 1.0 - (np.sum(valid) / valid.size)
+                if nan_fraction > 0.5:
+                    logger_file_only.warning(f"[SKIP] Box has {nan_fraction*100:.1f}% NaN pixels, skipping")
+                    continue
+                
+                # Get fit timeout from config (default 120s for groups)
+                fit_timeout = fit_cfg.get("fit_timeout", 120)
+                
+                # Run fit with timeout - retry with different initial guesses if it times out
+                result = None
+                timed_out = False
+                retry_count = 0
+                max_retries = 2
+                
+                while retry_count <= max_retries:
+                    # Create timeout wrapper for residual function (works with least_squares method)
+                    timeout_wrapper = TimeoutResidualWrapper(residual, fit_timeout, logger=logger_file_only)
+                    # Also create iter_cb for leastsq method
+                    timeout_cb = TimeoutCallback(fit_timeout, logger=logger_file_only)
+                    
+                    try:
+                        result = minimize(
+                            timeout_wrapper,
+                            params,
+                            args=(x_valid.ravel(), y_valid.ravel(), data_valid),
+                            kws={'weights': weights_valid},
+                            method=fit_cfg.get("fit_method", "leastsq"),
+                            iter_cb=timeout_cb,
+                            **minimize_kwargs
+                        )
+                        # Check both mechanisms for timeout
+                        timed_out = timeout_wrapper.timed_out or timeout_cb.timed_out
+                    except Exception as e:
+                        logger.error(f"[ERROR] Fit failed (box={cutout_masked.shape[1], cutout_masked.shape[0]}, order={order}): {e}")
+                        break
+                    
+                    if timed_out:
+                        retry_count += 1
+                        if retry_count <= max_retries:
+                            logger_file_only.warning(f"[RETRY] Retrying fit {retry_count}/{max_retries} with different initial guesses")
+                            # Modify initial guesses for retry: widen sigma bounds, perturb values
+                            for i in range(len(xcen_cut)):
+                                prefix = f"g{i}_"
+                                # Widen amplitude bounds
+                                old_amp = params[f"{prefix}amplitude"].value
+                                params[f"{prefix}amplitude"].set(min=0.0, max=old_amp * 3.0)
+                                # Perturb sigma values
+                                params[f"{prefix}sx"].set(value=(aper_inf+aper_sup)/2. * (1 + 0.2*retry_count))
+                                params[f"{prefix}sy"].set(value=(aper_inf+aper_sup)/2. * (1 + 0.2*retry_count))
+                            # Increase timeout for retry
+                            fit_timeout = int(fit_timeout * 1.5)
+                        else:
+                            logger.warning(f"[TIMEOUT] Fit timed out after {max_retries+1} attempts (box={cutout_masked.shape[1], cutout_masked.shape[0]}, order={order})")
+                            break
+                    else:
+                        break  # Fit completed successfully (or failed fast)
+                
+                if timed_out or result is None:
+                    continue     
  
                 # --- Evaluate reduced chi**2, BIC and NMSE (Normalized Mean Squared Error) statistics --- #
                 if result.success:
@@ -427,7 +639,7 @@ def fit_group_with_background(image, xcen, ycen, all_sources_xcen, all_sources_y
             sy = best_result.params[f"{prefix}sy"]
             th = best_result.params[f"{prefix}theta"]
             a = (np.cos(th)**2)/(2*sx**2) + (np.sin(th)**2)/(2*sy**2)
-            b = -np.sin(2*th)/(4*sx**2) + np.sin(2*th)/(4*sy**2)
+            b = np.sin(2*th)/(4*sx**2) - np.sin(2*th)/(4*sy**2)  # Fixed sign error
             c = (np.sin(th)**2)/(2*sx**2) + (np.cos(th)**2)/(2*sy**2)
             gauss_vals += A * np.exp(- (a*(xx - x0)**2 + 2*b*(xx - x0)*(yy - y0) + c*(yy - y0)**2))
 
@@ -555,8 +767,14 @@ def fit_group_with_background(image, xcen, ycen, all_sources_xcen, all_sources_y
             
             
 
+        if timer:
+            timer.log_timing("fitting.py", 25, 563, f"fit_group_with_background (group_id={group_id}, n_sources={len(group_indices)})", 
+                           time.time() - t_fit_start)
         return fit_status, best_result, model_fn, best_order, best_cutout, best_cutout_masked_full, best_slice, best_header, bg_mean, best_bg_model, best_box, best_nmse, best_redchi, best_bic
 
     else:
         # Ensure return is always complete
+        if timer:
+            timer.log_timing("fitting.py", 25, 566, f"fit_group_with_background FAILED (group_id={group_id})", 
+                           time.time() - t_fit_start)
         return 0, None, None, None, cutout_masked, None, (None, None), None, None, None, None, None, None, None
